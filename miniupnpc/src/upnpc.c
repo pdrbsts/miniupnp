@@ -12,9 +12,11 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include "win32_snprintf.h"
+#include <windows.h> /* For Sleep() */
 #else
 /* for IPPROTO_TCP / IPPROTO_UDP */
 #include <netinet/in.h>
+#include <unistd.h> /* For sleep() */
 #endif
 #include <ctype.h>
 #include "miniwget.h"
@@ -571,6 +573,7 @@ static void usage(FILE * out, const char * argv0) {
 	fprintf(out, "Usage:\n");
 	fprintf(out, "  %s [options] -a ip port external_port protocol [duration] [remote host]\n    Add port mapping\n", argv0);
 	fprintf(out, "  %s [options] -r port1 [external_port1] protocol1 [port2 [external_port2] protocol2] [...]\n    Add multiple port mappings to the current host\n", argv0);
+	fprintf(out, "  %s [options] -b port1 [external_port1] protocol1 [port2 [external_port2] protocol2] [...]\n    Check if port is mapped to another host, delete it if needed, and add mapping to the current host\n", argv0);
 	fprintf(out, "  %s [options] -d external_port protocol [remote host]\n    Delete port redirection\n", argv0);
 	fprintf(out, "  %s [options] -f external_port1 protocol1 [external_port2 protocol2] [...]\n    Delete multiple port redirections\n", argv0);
 	fprintf(out, "  %s [options] -s\n    Get Connection status\n", argv0);
@@ -599,6 +602,7 @@ static void usage(FILE * out, const char * argv0) {
 	fprintf(out, "  -p path : use this path for MiniSSDPd socket.\n");
 	fprintf(out, "  -t ttl : set multicast TTL. Default value is 2.\n");
 	fprintf(out, "  -i : ignore errors and try to use also disconnected IGD or non-IGD device.\n");
+	fprintf(out, "  -w time : wait time in minutes to wait and rerun the command (infinite loop).\n");
 }
 
 /* sample upnp client program */
@@ -621,6 +625,7 @@ int main(int argc, char ** argv)
 	int ignore = 0;
 	unsigned char ttl = 2;	/* defaulting to 2 */
 	const char * description = 0;
+	int wait_time_minutes = 0; /* time in minutes to wait before rerunning */
 
 #ifdef _WIN32
 	WSADATA wsaData;
@@ -674,6 +679,19 @@ int main(int argc, char ** argv)
 				ttl = (unsigned char)atoi(argv[++i]);
 			else if(argv[i][1] == 'i')
 				ignore = 1;
+			else if(argv[i][1] == 'w')
+			{
+				if (++i < argc) {
+					char junk;
+					if(sscanf(argv[i], "%d%c", &wait_time_minutes, &junk) != 1 || wait_time_minutes <= 0) {
+						fprintf(stderr, "Invalid wait time '%s'. Must be a positive integer.\n", argv[i]);
+						return 1;
+					}
+				} else {
+					fprintf(stderr, "Missing time value for -w option.\n");
+					return 1;
+				}
+			}
 			else
 			{
 				command = argv[i][1];
@@ -691,7 +709,7 @@ int main(int argc, char ** argv)
 
 	if(!command
 	   || (command == 'a' && commandargc<4)
-	   || (command == 'r' && commandargc<2)
+	   || ((command == 'r' || command == 'b') && commandargc<2)
 	   || (command == 'A' && commandargc<6)
 	   || (command == 'd' && commandargc<2)
 	   || (command == 'D' && commandargc<1)
@@ -757,6 +775,26 @@ int main(int argc, char ** argv)
 			if(i==UPNP_CONNECTED_IGD || i==UPNP_PRIVATEIP_IGD || ignore) {
 
 			printf("Local LAN ip address : %s\n", lanaddr);
+
+			/* Command execution loop */
+			do {
+				/* Make a mutable copy of args for this iteration in case of modification (e.g. '@') */
+				/* Use malloc for compatibility as VLA is not supported by MSVC */
+				char **current_commandargv = (char **)malloc(commandargc * sizeof(char *));
+				if (!current_commandargv) {
+					fprintf(stderr, "Memory allocation failed\n");
+					retcode = 1; /* Or some other error code */
+					break; /* Exit the loop */
+				}
+				memcpy(current_commandargv, commandargv, commandargc * sizeof(char *));
+				int current_commandargc = commandargc; /* Use separate argc if it can change */
+
+				/* Re-apply '@' replacement logic if necessary for the current command */
+				if ((command == 'a' || command == 'n') && commandargc > 0 && commandargv[0] && 0 == strcmp(commandargv[0], "@"))
+					current_commandargv[0] = lanaddr;
+				else if ((command == 'A' || command == 'G') && commandargc > 2 && commandargv[2] && 0 == strcmp(commandargv[2], "@"))
+					current_commandargv[2] = lanaddr;
+
 			#if 0
 			printf("getting \"%s\"\n", urls.ipcondescURL);
 			descXML = miniwget(urls.ipcondescURL, &descXMLsize);
@@ -784,117 +822,165 @@ int main(int argc, char ** argv)
 				break;
 			case 'a':
 				if (SetRedirectAndTest(&urls, &data,
-						   commandargv[0], commandargv[1],
-						   commandargv[2], commandargv[3],
-						   (commandargc > 4) && is_int(commandargv[4]) ? commandargv[4] : "0",
-						   (commandargc > 4) && !is_int(commandargv[4]) ? commandargv[4] : (commandargc > 5) ? commandargv[5] : NULL,
+						   current_commandargv[0], current_commandargv[1],
+						   current_commandargv[2], current_commandargv[3],
+						   (current_commandargc > 4) && is_int(current_commandargv[4]) ? current_commandargv[4] : "0",
+						   (current_commandargc > 4) && !is_int(current_commandargv[4]) ? current_commandargv[4] : (current_commandargc > 5) ? current_commandargv[5] : NULL,
 						   description, 0) < 0)
-					retcode = 2;
+					retcode = 2; /* Continue loop */
 				break;
 			case 'd':
-				if (RemoveRedirect(&urls, &data, commandargv[0], commandargv[1],
-				               commandargc > 2 ? commandargv[2] : NULL) < 0)
-					retcode = 2;
+				if (RemoveRedirect(&urls, &data, current_commandargv[0], current_commandargv[1],
+				               current_commandargc > 2 ? current_commandargv[2] : NULL) < 0)
+					retcode = 2; /* Continue loop */
 				break;
 			case 'n':	/* aNy */
 				if (SetRedirectAndTest(&urls, &data,
-						   commandargv[0], commandargv[1],
-						   commandargv[2], commandargv[3],
-						   (commandargc > 4) && is_int(commandargv[4]) ? commandargv[4] : "0",
-						   (commandargc > 4) && !is_int(commandargv[4]) ? commandargv[4] : (commandargc > 5) ? commandargv[5] : NULL,
+						   current_commandargv[0], current_commandargv[1],
+						   current_commandargv[2], current_commandargv[3],
+						   (current_commandargc > 4) && is_int(current_commandargv[4]) ? current_commandargv[4] : "0",
+						   (current_commandargc > 4) && !is_int(current_commandargv[4]) ? current_commandargv[4] : (current_commandargc > 5) ? current_commandargv[5] : NULL,
 						   description, 1) < 0)
-					retcode = 2;
+					retcode = 2; /* Continue loop */
 				break;
 			case 'N':
-				if (commandargc < 3)
-					fprintf(stderr, "too few arguments\n");
-
-				if (RemoveRedirectRange(&urls, &data, commandargv[0], commandargv[1], commandargv[2],
-						    commandargc > 3 ? commandargv[3] : NULL) < 0)
-					retcode = 2;
+				if (current_commandargc < 3)
+					fprintf(stderr, "too few arguments\n"); /* Continue loop */
+				else if (RemoveRedirectRange(&urls, &data, current_commandargv[0], current_commandargv[1], current_commandargv[2],
+						    current_commandargc > 3 ? current_commandargv[3] : NULL) < 0)
+					retcode = 2; /* Continue loop */
 				break;
 			case 's':
 				GetConnectionStatus(&urls, &data);
 				break;
 			case 'r':
-				i = 0;
-				while(i<commandargc)
-				{
-					if(!is_int(commandargv[i])) {
-						/* 1st parameter not an integer : error */
-						fprintf(stderr, "command -r : %s is not an port number\n", commandargv[i]);
-						retcode = 1;
-						break;
-					} else if(is_int(commandargv[i+1])){
-						/* 2nd parameter is an integer : <port> <external_port> <protocol> */
-						if (SetRedirectAndTest(&urls, &data,
-								   lanaddr, commandargv[i],
-								   commandargv[i+1], commandargv[i+2], "0", NULL,
-								   description, 0) < 0)
+				{ /* Block scope for k */
+					int k = 0;
+					while(k<current_commandargc)
+					{
+						if(!is_int(current_commandargv[k])) {
+							fprintf(stderr, "command -r : %s is not an port number\n", current_commandargv[k]);
+							retcode = 1; break; /* Break inner loop, continue outer */
+						} else if(is_int(current_commandargv[k+1])){
+							if (SetRedirectAndTest(&urls, &data,
+									   lanaddr, current_commandargv[k],
+									   current_commandargv[k+1], current_commandargv[k+2], "0", NULL,
+									   description, 0) < 0) retcode = 2;
+							k+=3;
+						} else {
+							if (SetRedirectAndTest(&urls, &data,
+									   lanaddr, current_commandargv[k],
+									   current_commandargv[k], current_commandargv[k+1], "0", NULL,
+									   description, 0) < 0) retcode = 2;
+							k+=2;
+						}
+					}
+				}
+				break;
+			case 'b': /* Check, Delete if needed, Add */
+				{ /* Block scope for k */
+					int k = 0;
+					while(k<current_commandargc)
+					{
+						const char * iport_b;
+						const char * eport_b;
+						const char * proto_b;
+						char existingIntClient_b[40];
+						char existingIntPort_b[6];
+						char existingDuration_b[16];
+						int r_b;
+
+						if(!is_int(current_commandargv[k])) {
+							fprintf(stderr, "command -b : %s is not an port number\n", current_commandargv[k]);
+							retcode = 1; break; /* Break inner loop, continue outer */
+						}
+						iport_b = current_commandargv[k];
+
+						if(is_int(current_commandargv[k+1])){
+							if(k+2 >= current_commandargc) { fprintf(stderr, "command -b : missing protocol after %s %s\n", current_commandargv[k], current_commandargv[k+1]); retcode = 1; break; }
+							eport_b = current_commandargv[k+1];
+							proto_b = protofix(current_commandargv[k+2]);
+							if(!proto_b) { fprintf(stderr, "command -b : invalid protocol %s\n", current_commandargv[k+2]); retcode = 1; break; }
+							k+=3;
+						} else {
+							if(k+1 >= current_commandargc) { fprintf(stderr, "command -b : missing protocol after %s\n", current_commandargv[k]); retcode = 1; break; }
+							eport_b = current_commandargv[k];
+							proto_b = protofix(current_commandargv[k+1]);
+							if(!proto_b) { fprintf(stderr, "command -b : invalid protocol %s\n", current_commandargv[k+1]); retcode = 1; break; }
+							k+=2;
+						}
+
+						r_b = UPNP_GetSpecificPortMappingEntry(urls.controlURL, data.first.servicetype, eport_b, proto_b, NULL, existingIntClient_b, existingIntPort_b, NULL, NULL, existingDuration_b);
+						if(r_b == UPNPCOMMAND_SUCCESS) {
+							if(strcmp(existingIntClient_b, lanaddr) != 0) {
+								printf("Existing mapping found for %s:%s %s -> %s:%s. Deleting it.\n", wanaddr, eport_b, proto_b, existingIntClient_b, existingIntPort_b);
+								r_b = UPNP_DeletePortMapping(urls.controlURL, data.first.servicetype, eport_b, proto_b, NULL);
+								if(r_b != UPNPCOMMAND_SUCCESS) fprintf(stderr, "Failed to delete existing port mapping %s %s (error %d: %s)\n", eport_b, proto_b, r_b, strupnperror(r_b));
+								else printf("Existing mapping deleted successfully.\n");
+							} else {
+								printf("Mapping already exists for this host (%s:%s %s -> %s:%s). Skipping add.\n", wanaddr, eport_b, proto_b, existingIntClient_b, existingIntPort_b);
+								continue;
+							}
+						} else if (r_b != 714) {
+							fprintf(stderr, "Error checking existing port mapping %s %s (error %d: %s)\n", eport_b, proto_b, r_b, strupnperror(r_b));
+						}
+
+						printf("Adding mapping: external %s %s -> internal %s:%s\n", eport_b, proto_b, lanaddr, iport_b);
+						r_b = UPNP_AddPortMapping(urls.controlURL, data.first.servicetype, eport_b, iport_b, lanaddr, description, proto_b, NULL, "0");
+						if(r_b != UPNPCOMMAND_SUCCESS) {
+							fprintf(stderr, "Failed to add port mapping %s %s -> %s:%s (error %d: %s)\n", eport_b, proto_b, lanaddr, iport_b, r_b, strupnperror(r_b));
 							retcode = 2;
-						i+=3;	/* 3 parameters parsed */
-					} else {
-						/* 2nd parameter not an integer : <port> <protocol> */
-						if (SetRedirectAndTest(&urls, &data,
-								   lanaddr, commandargv[i],
-								   commandargv[i], commandargv[i+1], "0", NULL,
-								   description, 0) < 0)
-							retcode = 2;
-						i+=2;	/* 2 parameters parsed */
+						} else {
+							printf("Port mapping added successfully.\n");
+						}
 					}
 				}
 				break;
 			case 'f':
-				i = 0;
-				while(i<commandargc)
-				{
-					if(!is_int(commandargv[i])) {
-						/* 1st parameter not an integer : error */
-						fprintf(stderr, "command -f : %s is not an port number\n", commandargv[i]);
-						retcode = 1;
-						break;
-					} else if(i+1 == commandargc){
-						/* too few arguments */
-						fprintf(stderr, "command -f : too few arguments\n");
-						retcode = 2;
-						break;
-					} else {
-						/* <port> <protocol> */
-						if (RemoveRedirect(&urls, &data,
-								commandargv[i], commandargv[i+1], NULL) < 0)
-							retcode = 3;
-						i+=2;	/* 2 parameters parsed */
+				{ /* Block scope for k */
+					int k = 0;
+					while(k<current_commandargc)
+					{
+						if(!is_int(current_commandargv[k])) {
+							fprintf(stderr, "command -f : %s is not an port number\n", current_commandargv[k]);
+							retcode = 1; break; /* Break inner loop, continue outer */
+						} else if(k+1 == current_commandargc){
+							fprintf(stderr, "command -f : too few arguments\n");
+							retcode = 2; break; /* Break inner loop, continue outer */
+						} else {
+							if (RemoveRedirect(&urls, &data, current_commandargv[k], current_commandargv[k+1], NULL) < 0) retcode = 3;
+							k+=2;
+						}
 					}
 				}
 				break;
 			case 'A':
 				if (SetPinholeAndTest(&urls, &data,
-				                  commandargv[0], commandargv[1],
-				                  commandargv[2], commandargv[3],
-				                  commandargv[4], commandargv[5]) < 0)
-					retcode = 2;
+				                  current_commandargv[0], current_commandargv[1],
+				                  current_commandargv[2], current_commandargv[3],
+				                  current_commandargv[4], current_commandargv[5]) < 0)
+					retcode = 2; /* Continue loop */
 				break;
 			case 'U':
 				GetPinholeAndUpdate(&urls, &data,
-				                   commandargv[0], commandargv[1]);
+				                   current_commandargv[0], current_commandargv[1]);
 				break;
 			case 'C':
-				for(i=0; i<commandargc; i++)
-				{
-					CheckPinhole(&urls, &data, commandargv[i]);
+				{ /* Block scope for k */
+					int k;
+					for(k=0; k<current_commandargc; k++) CheckPinhole(&urls, &data, current_commandargv[k]);
 				}
 				break;
 			case 'K':
-				for(i=0; i<commandargc; i++)
-				{
-					GetPinholePackets(&urls, &data, commandargv[i]);
+				{ /* Block scope for k */
+					int k;
+					for(k=0; k<current_commandargc; k++) GetPinholePackets(&urls, &data, current_commandargv[k]);
 				}
 				break;
 			case 'D':
-				for(i=0; i<commandargc; i++)
-				{
-					if (RemovePinhole(&urls, &data, commandargv[i]) < 0)
-						retcode = 2;
+				{ /* Block scope for k */
+					int k;
+					for(k=0; k<current_commandargc; k++) if (RemovePinhole(&urls, &data, current_commandargv[k]) < 0) retcode = 2; /* Continue loop */
 				}
 				break;
 			case 'S':
@@ -902,9 +988,9 @@ int main(int argc, char ** argv)
 				break;
 			case 'G':
 				GetPinholeOutboundTimeout(&urls, &data,
-							commandargv[0], commandargv[1],
-							commandargv[2], commandargv[3],
-							commandargv[4]);
+							current_commandargv[0], current_commandargv[1],
+							current_commandargv[2], current_commandargv[3],
+							current_commandargv[4]);
 				break;
 			case 'P':
 				printf("Presentation URL found:\n");
@@ -913,7 +999,21 @@ int main(int argc, char ** argv)
 			default:
 				fprintf(stderr, "Unknown switch -%c\n", command);
 				retcode = 1;
+				wait_time_minutes = 0; /* Exit loop on unknown command */
+				break;
 			}
+
+				/* Wait if requested */
+				if (wait_time_minutes > 0) {
+					printf("Waiting %d minutes before re-running...\n", wait_time_minutes);
+#ifdef _WIN32
+					Sleep(wait_time_minutes * 60 * 1000);
+#else
+					sleep(wait_time_minutes * 60);
+#endif
+				}
+				free(current_commandargv); /* Free the allocated memory */
+			} while (wait_time_minutes > 0); /* End of command execution loop */
 
 			} else {
 				fprintf(stderr, "No valid UPNP Internet Gateway Device found.\n");
@@ -941,4 +1041,3 @@ int main(int argc, char ** argv)
 #endif /* _WIN32 */
 	return retcode;
 }
-
